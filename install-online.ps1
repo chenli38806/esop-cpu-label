@@ -1,10 +1,14 @@
-# esop-cpu-label one-line installer.
-# Usage on any Windows computer:
-#   irm https://raw.githubusercontent.com/<OWNER>/esop-cpu-label/main/install-online.ps1 | iex
+# esop-cpu-label one-line installer (multi-source, CN-friendly).
+#
+# Recommended on any Windows computer:
+#   irm https://cdn.jsdelivr.net/gh/chenli38806/esop-cpu-label@main/install-online.ps1 | iex
+#
+# Mirrors are tried automatically in order:
+#   1) cdn.jsdelivr.net   2) ghproxy.net   3) raw.githubusercontent.com
 #
 # Self-contained: checks Python, installs Pillow if missing, downloads
-# esop-cpu-label.zip from the repo, and copies the skill into the Doubao user
-# skill folder.
+# esop-cpu-label.zip from the repo (falling back across mirrors), unpacks it
+# into the Doubao user skill folder.
 #
 # NOTE: keep this file pure ASCII. Windows PowerShell 5.1 decodes downloaded
 # UTF-8 text as ANSI and non-ASCII comment bytes can swallow following code.
@@ -23,7 +27,7 @@ if ($RepoOwner -eq "OWNER" -or [string]::IsNullOrWhiteSpace($RepoOwner)) {
 }
 
 Write-Host "=== esop-cpu-label installer ==="
-Write-Host "repo: $RepoOwner/$RepoName"
+Write-Host "repo: $RepoOwner/$RepoName ($Branch)"
 
 # ---- 1. python ----
 $python = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -40,7 +44,7 @@ Write-Host "[OK] python: $python"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[..] installing pillow ..."
     & $python -m pip install --quiet pillow
-    & $python -c "import PIL"
+    & $python -c "import PIL" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[ERR] pillow install failed. Run manually: python -m pip install pillow" -ForegroundColor Red
         exit 1
@@ -49,38 +53,62 @@ if ($LASTEXITCODE -ne 0) {
 $pv = & $python -c "import PIL; print(PIL.__version__)"
 Write-Host "[OK] pillow: $pv"
 
-# ---- 3. download skill package ----
-$tmp = Join-Path $env:TEMP ("esop_dl_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
-$zip = Join-Path $tmp $ZipName
-$url = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/$ZipName"
+# ---- 3. download skill package (try mirrors in order) ----
+$bases = @(
+    "https://cdn.jsdelivr.net/gh/$RepoOwner/$RepoName@$Branch",
+    "https://ghproxy.net/https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch",
+    "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch"
+)
 
-Write-Host "[..] downloading skill package"
+$tmp = Join-Path $env:TEMP ("esop_dl_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-try {
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-} catch {
-    Write-Host "[ERR] download failed: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "      raw.githubusercontent.com may be blocked here."
-    Write-Host "      Fallback: open the repo page, download $ZipName, unzip, run install.ps1"
+$zip = Join-Path $tmp $ZipName
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$got = $false
+foreach ($b in $bases) {
+    $url = "$b/$ZipName"
+    Write-Host "[..] downloading: $url"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60
+        if (-not (Test-Path $zip)) { throw "no file written" }
+        if ((Get-Item -LiteralPath $zip).Length -lt 100000) { throw "package too small (truncated?)" }
+        $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
+        $names = $za.Entries | ForEach-Object { $_.FullName }
+        $za.Dispose()
+        if (-not ($names -match "SKILL\.md$")) { throw "SKILL.md missing inside zip" }
+        $got = $true
+        Write-Host "[OK] downloaded ($((Get-Item -LiteralPath $zip).Length) bytes, $($names.Count) entries)"
+        break
+    } catch {
+        Write-Host "[WARN] source failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not $got) {
+    Write-Host "[ERR] all download sources failed." -ForegroundColor Red
+    Write-Host "      Manual fallback: download $ZipName from the repo page,"
+    Write-Host "      unzip it and copy the esop-cpu-label folder into:"
+    Write-Host "      $env:LOCALAPPDATA\Doubao\User Data\Default\.doubao\agent_mode\workspace\.user_skills"
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     exit 1
 }
-if (-not (Test-Path $zip)) {
-    Write-Host "[ERR] package not downloaded" -ForegroundColor Red
-    exit 1
-}
 
-Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
+$ex = Join-Path $tmp "unpack"
+New-Item -ItemType Directory -Force -Path $ex | Out-Null
+Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
 
 # find the folder that holds SKILL.md
 $src = $null
-if (Test-Path (Join-Path $tmp "SKILL.md")) { $src = $tmp }
+if (Test-Path (Join-Path $ex "SKILL.md")) { $src = $ex }
 if (-not $src) {
-    $d = Get-ChildItem $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName "SKILL.md") } | Select-Object -First 1
+    $d = Get-ChildItem $ex -Directory | Where-Object { Test-Path (Join-Path $_.FullName "SKILL.md") } | Select-Object -First 1
     if ($d) { $src = $d.FullName }
 }
 if (-not $src) {
-    Write-Host "[ERR] SKILL.md not found in package" -ForegroundColor Red
+    Write-Host "[ERR] SKILL.md not found after unpacking" -ForegroundColor Red
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     exit 1
 }
@@ -92,15 +120,22 @@ if (-not $Target) {
 $dest = Join-Path $Target "esop-cpu-label"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Copy-Item -Path (Join-Path $src "*") -Destination $dest -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $dest $ZipName) -Force -ErrorAction SilentlyContinue
 Write-Host "[OK] skill installed to: $dest"
 
-# ---- 5. font + syntax check ----
+# ---- 5. sanity checks ----
 $fonts = @("C:\Windows\Fonts\msyhbd.ttc", "C:\Windows\Fonts\msyh.ttc", "C:\Windows\Fonts\simhei.ttf")
 $hit = $fonts | Where-Object { Test-Path $_ }
 if ($hit) { Write-Host "[OK] chinese font: $(Split-Path $hit[0] -Leaf)" }
-else { Write-Host "[WARN] no Microsoft YaHei; falls back to Noto Sans CJK / PingFang" -ForegroundColor Yellow }
+else { Write-Host "[WARN] no Microsoft YaHei; falls back to other CJK fonts" -ForegroundColor Yellow }
 
 & $python -c "import ast,glob,os; [ast.parse(open(p,encoding='utf-8-sig').read()) for p in glob.glob(os.path.join(r'$dest','scripts','*.py'))]; print('[OK] scripts syntax check passed')"
+
+foreach ($f in @("SKILL.md", "scripts\esop_build.py", "scripts\validate.py", "references\label-rules.md")) {
+    if (-not (Test-Path (Join-Path $dest $f))) {
+        Write-Host "[WARN] missing: $f" -ForegroundColor Yellow
+    }
+}
 
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
